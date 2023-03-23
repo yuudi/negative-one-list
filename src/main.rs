@@ -17,6 +17,7 @@ fn create_client(conf: Conf) -> Result<oauth2::Client> {
         conf.token_url,
         conf.redirect_url,
         Some(conf.refresh_token),
+        conf.drive_id,
     );
     Ok(client)
 }
@@ -29,6 +30,7 @@ struct Conf {
     token_url: String,
     redirect_url: String,
     refresh_token: String,
+    drive_id: String,
 }
 
 enum DriveItem {
@@ -60,7 +62,7 @@ const HTML_AFTER: &str = r#"</body>
 async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
     let uri = req.match_info().get("uri").unwrap_or("");
     let access_token = client.get_access_token().await;
-    match get_item(uri, &access_token.unwrap()).await {
+    match get_item(&client.drive_id, uri, &access_token.unwrap()).await {
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
         Ok(DriveItem::File { name, content_url }) => HttpResponse::Found()
             .insert_header(("Location", content_url))
@@ -84,7 +86,7 @@ async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
                         ));
                     }
                     DriveItem::Folder { name, children } => {
-                        body.push_str(&format!(r#"<a href="./{}">{}/</a><br/>"#, name, name));
+                        body.push_str(&format!(r#"<a href="./{}/">{}/</a><br/>"#, name, name));
                     }
                 }
             }
@@ -94,13 +96,16 @@ async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
     }
 }
 
-async fn get_item(path: &str, token: &str) -> Result<DriveItem> {
+async fn get_item(drive_id: &str, path: &str, token: &str) -> Result<DriveItem> {
     let reqwest_client = reqwest::Client::new();
     let response = reqwest_client
         .get(if path.is_empty() {
-            "https://graph.microsoft.com/v1.0/me/drive/root".to_string()
+            format!("https://graph.microsoft.com/v1.0/drives/{}/root", drive_id)
         } else {
-            format!("https://graph.microsoft.com/v1.0/me/drive/root:/{}", path)
+            format!(
+                "https://graph.microsoft.com/v1.0/drives/{}/root:/{}",
+                drive_id, path
+            )
         })
         .bearer_auth(token)
         .send()
@@ -124,7 +129,7 @@ async fn get_item(path: &str, token: &str) -> Result<DriveItem> {
         Ok(DriveItem::File { name, content_url })
     } else {
         let item_id = json["id"].as_str().unwrap();
-        let children = get_children(item_id, token).await?;
+        let children = get_children(drive_id, item_id, token).await?;
         Ok(DriveItem::Folder {
             name,
             children: Some(children),
@@ -132,12 +137,12 @@ async fn get_item(path: &str, token: &str) -> Result<DriveItem> {
     }
 }
 
-async fn get_children(item_id: &str, token: &str) -> Result<Vec<DriveItem>> {
+async fn get_children(drive_id: &str, item_id: &str, token: &str) -> Result<Vec<DriveItem>> {
     let reqwest_client = reqwest::Client::new();
     let response = reqwest_client
         .get(format!(
-            "https://graph.microsoft.com/v1.0/me/drive/items/{}/children",
-            item_id
+            "https://graph.microsoft.com/v1.0/drives/{}/items/{}/children",
+            drive_id, item_id
         ))
         .bearer_auth(token)
         .send()
@@ -173,7 +178,6 @@ fn init_client() -> Result<oauth2::Client> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
 
     HttpServer::new(move || {

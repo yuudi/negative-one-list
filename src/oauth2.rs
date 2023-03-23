@@ -15,6 +15,7 @@ pub struct Client {
     token_url: String,
     redirect_url: String,
     tokens: RwLock<(AccessToken, RefreshToken)>,
+    pub drive_id: String,
 }
 
 struct AccessToken {
@@ -39,6 +40,7 @@ impl Client {
         token_url: String,
         redirect_url: String,
         refresh_token: Option<String>,
+        drive_id: String,
     ) -> Self {
         Self {
             client_id,
@@ -53,6 +55,7 @@ impl Client {
                 },
                 refresh_token.unwrap_or(String::new()),
             )),
+            drive_id,
         }
     }
 
@@ -78,7 +81,7 @@ impl Client {
         let resp =  reqwest_client
             .post(self.token_url.as_str())
             .body(format!(
-                "client_id={}&client_secret={}&scope=Files.Read.All&redirect_uri={}&grant_type=refresh_token&refresh_token={}",
+                "client_id={}&client_secret={}&scope=Files.Read&redirect_uri={}&grant_type=refresh_token&refresh_token={}",
                 self.client_id,
                 self.client_secret,
                 self.redirect_url,
