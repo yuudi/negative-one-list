@@ -31,11 +31,135 @@ struct Conf {
     refresh_token: String,
 }
 
+enum DriveItem {
+    File {
+        name: String,
+        content_url: String,
+    },
+    Folder {
+        name: String,
+        children: Option<Vec<DriveItem>>,
+    },
+}
+
+const HTML_BEFORE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Document</title>
+<link rel="shortcut icon" href="data:;">
+</head>
+<body>"#;
+
+const HTML_AFTER: &str = r#"</body>
+</html>"#;
+
 #[get("/{uri:.*}")]
 async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
     let uri = req.match_info().get("uri").unwrap_or("");
     let access_token = client.get_access_token().await;
-    HttpResponse::Ok().body(format!("Hello /{}!", uri))
+    match get_item(uri, &access_token.unwrap()).await {
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+        Ok(DriveItem::File { name, content_url }) => HttpResponse::Found()
+            .insert_header(("Location", content_url))
+            .finish(),
+        Ok(DriveItem::Folder {
+            name,
+            children: None,
+        }) => HttpResponse::Ok().body(name),
+        Ok(DriveItem::Folder {
+            name,
+            children: Some(children),
+        }) => {
+            let mut body = String::from(HTML_BEFORE);
+            body.push_str(&format!("<h1>{}</h1>", name));
+            for child in children {
+                match child {
+                    DriveItem::File { name, content_url } => {
+                        body.push_str(&format!(
+                            r#"<a href="{}" download>{}</a><br/>"#,
+                            content_url, name
+                        ));
+                    }
+                    DriveItem::Folder { name, children } => {
+                        body.push_str(&format!(r#"<a href="./{}">{}/</a><br/>"#, name, name));
+                    }
+                }
+            }
+            body.push_str(HTML_AFTER);
+            HttpResponse::Ok().body(body)
+        }
+    }
+}
+
+async fn get_item(path: &str, token: &str) -> Result<DriveItem> {
+    let reqwest_client = reqwest::Client::new();
+    let response = reqwest_client
+        .get(if path.is_empty() {
+            "https://graph.microsoft.com/v1.0/me/drive/root".to_string()
+        } else {
+            format!("https://graph.microsoft.com/v1.0/me/drive/root:/{}", path)
+        })
+        .bearer_auth(token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return if response.status() == reqwest::StatusCode::NOT_FOUND {
+            Err("404 Not found".into())
+        } else {
+            Err(format!("Error: {}", response.status()).into())
+        };
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    let name = json["name"].as_str().unwrap().to_string();
+    if json["folder"].is_null() {
+        let content_url = json["@microsoft.graph.downloadUrl"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        Ok(DriveItem::File { name, content_url })
+    } else {
+        let item_id = json["id"].as_str().unwrap();
+        let children = get_children(item_id, token).await?;
+        Ok(DriveItem::Folder {
+            name,
+            children: Some(children),
+        })
+    }
+}
+
+async fn get_children(item_id: &str, token: &str) -> Result<Vec<DriveItem>> {
+    let reqwest_client = reqwest::Client::new();
+    let response = reqwest_client
+        .get(format!(
+            "https://graph.microsoft.com/v1.0/me/drive/items/{}/children",
+            item_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let json: serde_json::Value = response.json().await?;
+    let mut children = Vec::new();
+    for item in json["value"].as_array().unwrap() {
+        let name = item["name"].as_str().unwrap().to_string();
+        if item["folder"].is_null() {
+            let content_url = item["@microsoft.graph.downloadUrl"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            children.push(DriveItem::File { name, content_url });
+        } else {
+            children.push(DriveItem::Folder {
+                name,
+                children: None,
+            });
+        }
+    }
+    Ok(children)
 }
 
 fn init_client() -> Result<oauth2::Client> {

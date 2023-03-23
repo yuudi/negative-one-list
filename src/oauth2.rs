@@ -60,10 +60,8 @@ impl Client {
         let token = self.tokens.read().await;
         // check token is expired
         if now() < token.0.expires_in {
-            println!("token is not expired");
             Ok(token.0.access_token.clone())
         } else {
-            println!("token is expired");
             drop(token);  // drop the read lock and acquire a write lock
             let access_token = self.refresh().await?;
             Ok(access_token)
@@ -72,6 +70,10 @@ impl Client {
 
     async fn refresh(&self) -> Result<String> {
         let mut token = self.tokens.write().await;
+        // check token is expired again
+        if now() < token.0.expires_in {
+            return Ok(token.0.access_token.clone());
+        }
         let reqwest_client = reqwest::Client::new();
         let resp =  reqwest_client
             .post(self.token_url.as_str())
