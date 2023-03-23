@@ -1,0 +1,36 @@
+on: [push, pull_request]
+
+name: Cross-compile
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu # linux_x86-64
+          - aarch64-unknown-linux-gnu # linux_arm64
+          - x86_64-pc-windows-gnu # windows_x86-64
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - uses: actions-rs/cargo@v1
+        with:
+          use-cross: true
+          command: build
+          args: --release --target=${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: target-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/negative-one-list
+            target/${{ matrix.target }}/release/negative-one-list.exe
