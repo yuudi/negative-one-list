@@ -2,7 +2,7 @@ use actix_web::{get, web::Data, App, HttpRequest, HttpResponse, HttpServer, Resp
 use config::Config;
 use env_logger;
 use serde::Deserialize;
-use std::error;
+use std::{error, sync::Arc};
 
 use crate::oauth2::Client;
 mod oauth2;
@@ -63,7 +63,12 @@ async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
     let uri = req.match_info().get("uri").unwrap_or("");
     let access_token = client.get_access_token().await;
     match get_item(&client.drive_id, uri, &access_token.unwrap()).await {
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+        Err(e) => {
+            let mut body = String::from(HTML_BEFORE);
+            body.push_str(e.to_string().as_str());
+            body.push_str(HTML_AFTER);
+            HttpResponse::InternalServerError().body(body)
+        }
         Ok(DriveItem::File { name, content_url }) => HttpResponse::Found()
             .insert_header(("Location", content_url))
             .finish(),
@@ -97,20 +102,27 @@ async fn listing(req: HttpRequest, client: Data<Client>) -> impl Responder {
 }
 
 async fn get_item(drive_id: &str, path: &str, token: &str) -> Result<DriveItem> {
+    if path.is_empty() {
+        get_folder(drive_id, path, token).await
+    } else if path.ends_with('/') {
+        // trim trailing slash because microsoft graph api doesn't like it
+        let path = &path[..path.len() - 1];
+        get_folder(drive_id, path, token).await
+    } else {
+        get_file(drive_id, path, token).await
+    }
+}
+
+async fn get_file(drive_id: &str, path: &str, token: &str) -> Result<DriveItem> {
     let reqwest_client = reqwest::Client::new();
     let response = reqwest_client
-        .get(if path.is_empty() {
-            format!("https://graph.microsoft.com/v1.0/drives/{}/root", drive_id)
-        } else {
-            format!(
-                "https://graph.microsoft.com/v1.0/drives/{}/root:/{}",
-                drive_id, path
-            )
-        })
+        .get(format!(
+            "https://graph.microsoft.com/v1.0/drives/{}/root:/{}",
+            drive_id, path
+        ))
         .bearer_auth(token)
         .send()
         .await?;
-
     if !response.status().is_success() {
         return if response.status() == reqwest::StatusCode::NOT_FOUND {
             Err("404 Not found".into())
@@ -118,35 +130,40 @@ async fn get_item(drive_id: &str, path: &str, token: &str) -> Result<DriveItem> 
             Err(format!("Error: {}", response.status()).into())
         };
     }
-
     let json: serde_json::Value = response.json().await?;
     let name = json["name"].as_str().unwrap().to_string();
-    if json["folder"].is_null() {
-        let content_url = json["@microsoft.graph.downloadUrl"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        Ok(DriveItem::File { name, content_url })
-    } else {
-        let item_id = json["id"].as_str().unwrap();
-        let children = get_children(drive_id, item_id, token).await?;
-        Ok(DriveItem::Folder {
-            name,
-            children: Some(children),
-        })
+    let content_url_value = &json["@microsoft.graph.downloadUrl"];
+    if !content_url_value.is_string() {
+        return Err("Not a file".into());
     }
+    let content_url = content_url_value.as_str().unwrap().to_string();
+    Ok(DriveItem::File { name, content_url })
 }
 
-async fn get_children(drive_id: &str, item_id: &str, token: &str) -> Result<Vec<DriveItem>> {
+async fn get_folder(drive_id: &str, path: &str, token: &str) -> Result<DriveItem> {
     let reqwest_client = reqwest::Client::new();
     let response = reqwest_client
-        .get(format!(
-            "https://graph.microsoft.com/v1.0/drives/{}/items/{}/children",
-            drive_id, item_id
-        ))
+        .get(if path.is_empty() {
+            format!(
+                "https://graph.microsoft.com/v1.0/drives/{}/root/children",
+                drive_id
+            )
+        } else {
+            format!(
+                "https://graph.microsoft.com/v1.0/drives/{}/root:/{}:/children",
+                drive_id, path
+            )
+        })
         .bearer_auth(token)
         .send()
         .await?;
+    if !response.status().is_success() {
+        return if response.status() == reqwest::StatusCode::NOT_FOUND {
+            Err("404 Not found".into())
+        } else {
+            Err(format!("Error: {}", response.status()).into())
+        };
+    }
     let json: serde_json::Value = response.json().await?;
     let mut children = Vec::new();
     for item in json["value"].as_array().unwrap() {
@@ -164,7 +181,10 @@ async fn get_children(drive_id: &str, item_id: &str, token: &str) -> Result<Vec<
             });
         }
     }
-    Ok(children)
+    Ok(DriveItem::Folder {
+        name: path.to_string(),
+        children: Some(children),
+    })
 }
 
 fn init_client() -> Result<oauth2::Client> {
